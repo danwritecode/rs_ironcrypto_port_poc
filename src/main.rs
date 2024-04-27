@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{str::from_utf8, time::{SystemTime, UNIX_EPOCH}};
 use base64::{Engine as _, engine::general_purpose};
 use anyhow::Result;
 
@@ -7,7 +7,14 @@ use pbkdf2::pbkdf2;
 use sha2::Sha256;
 use sha1::Sha1;
 use subtle::ConstantTimeEq;
+use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
+
+
+type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
+type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 
 const mac_prefix: &str = "Fe26.2";
 
@@ -37,31 +44,40 @@ fn main() -> Result<()> {
         panic!("Invalid prefix");
     }
 
-    let res = validate_hmac_signature(password, &mac_base_string, hmac_salt, 1, 32, hmac)?;
+    // validate the hmac
+    let hmac_key = generate_key(password, hmac_salt, 1, 32)?;
+    let res = validate_hmac_signature(&mac_base_string, hmac, hmac_key)?;
 
-    println!("res: {}", res);
+    // decrypt the data
+    let decrypt_key = generate_key(password, encryption_salt, 1, 32)?;
+    let encryption_iv = decode_base64(encryption_iv_b64)?;
+    let ciphertext = decode_base64(encrypted_b64)?;
+
+    let key_array: [u8; 32] = decrypt_key.try_into().unwrap();
+    let iv_array: [u8; 16] = encryption_iv[..].try_into().unwrap();
+
+    let mut buf = vec![0u8; ciphertext.len()];
+    buf.copy_from_slice(&ciphertext);
+
+    let pt = Aes256CbcDec::new(&key_array.into(), &iv_array.into())
+        .decrypt_padded_vec_mut::<Pkcs7>(&mut buf)
+        .unwrap();
+
+    let pt_json: Value = serde_json::from_str(from_utf8(&pt).unwrap())?;
+
+    // profit
+    println!("pt_json: {:?}", pt_json);
 
     Ok(())
 }
 
 pub fn validate_hmac_signature(
-    password: &str,
     data: &str,
-    salt: &str,
-    iterations: u32,
-    key_length: usize,
     hmac: &str,
+    key: Vec<u8>,
 ) -> Result<bool> {
-    let mut derived_key = vec![0u8; key_length];
-    pbkdf2::<Hmac<Sha1>>(
-        password.as_bytes(),
-        salt.as_bytes(),
-        iterations,
-        &mut derived_key,
-    )?;
-
     let data_buffer = data.as_bytes();
-    let mut mac = Hmac::<Sha256>::new_from_slice(&derived_key)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(&key)?;
     mac.update(data_buffer);
 
     let result = mac.finalize();
@@ -77,9 +93,20 @@ pub fn validate_hmac_signature(
     }
 }
 
+fn generate_key(password: &str, salt: &str, iterations: u32, key_length: usize) -> Result<Vec<u8>> {
+    let mut derived_key = vec![0u8; key_length];
+    pbkdf2::<Hmac<Sha1>>(
+        password.as_bytes(),
+        salt.as_bytes(),
+        iterations,
+        &mut derived_key,
+    )?;
+
+    Ok(derived_key)
+}
 
 fn decode_base64(input: &str) -> Result<Vec<u8>> {
-    let bytes = general_purpose::URL_SAFE.decode(input)?;
+    let bytes = general_purpose::URL_SAFE_NO_PAD.decode(input)?;
     Ok(bytes)
 }
 
